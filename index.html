@@ -67,7 +67,7 @@
     <div id="root"></div>
     <script type="module" src="./src/main.tsx"></script>
     <script>
-      // Automatic GitHub Pages / Static Host Live Compiler (runs ONLY when Vite/Express server is not present)
+      // Automatic GitHub Pages / Static Host Loader
       (function () {
         var isStatic =
           window.location.hostname.indexOf('github.io') !== -1 ||
@@ -78,6 +78,32 @@
         function bootStaticApp() {
           if (window.__khojauMounted || window.__khojauStaticBooting) return;
           window.__khojauStaticBooting = true;
+
+          // First check if pre-compiled production bundle (./dist/assets/app-bundle.js) exists in repo root
+          fetch('./dist/assets/app-bundle.js', { method: 'HEAD' })
+            .then(function (r) {
+              if (r.ok) {
+                var cssLink = document.createElement('link');
+                cssLink.rel = 'stylesheet';
+                cssLink.href = './dist/assets/app-bundle.css';
+                document.head.appendChild(cssLink);
+
+                var bundleScript = document.createElement('script');
+                bundleScript.type = 'module';
+                bundleScript.src = './dist/assets/app-bundle.js';
+                document.body.appendChild(bundleScript);
+                return true;
+              }
+              return false;
+            })
+            .catch(function () { return false; })
+            .then(function (loadedPrebuilt) {
+              if (loadedPrebuilt) return;
+              bootBabelCompiler();
+            });
+        }
+
+        function bootBabelCompiler() {
 
           // 1. Load Tailwind v4 Browser Play CDN for full utility class styling
           var tw = document.createElement('script');
@@ -95,11 +121,12 @@
             })
             .catch(function () {});
 
-          // 3. Load Babel Standalone to compile & bundle local .ts/.tsx/.json modules in-browser with parallel loading & session cache
+          // 3. Load Babel Standalone to compile & bundle local .ts/.tsx/.json modules in-browser with parallel loading
           var babelScript = document.createElement('script');
           babelScript.src = 'https://unpkg.com/@babel/standalone@7.26.9/babel.min.js';
           babelScript.onload = async function () {
             var modulePromises = {};
+            var rawSourceCache = {};
 
             function resolvePath(basePath, relPath) {
               if (!relPath.startsWith('.')) return relPath;
@@ -114,6 +141,55 @@
               return './' + stack.join('/');
             }
 
+            async function fetchAndTransformRaw(modPath) {
+              if (rawSourceCache[modPath]) return rawSourceCache[modPath];
+
+              var res = await fetch(modPath);
+              if (!res.ok && !modPath.endsWith('.ts') && !modPath.endsWith('.tsx') && !modPath.endsWith('.json')) {
+                res = await fetch(modPath + '.tsx');
+                if (!res.ok) res = await fetch(modPath + '.ts');
+              }
+
+              var rawCode = await res.text();
+              // Strip TypeScript type-only imports so they are not fetched at runtime
+              rawCode = rawCode.replace(/import\s+type\s+[^;]+;/g, '');
+              // Replace import.meta.env references safely
+              rawCode = rawCode.replace(/import\.meta\.env\.BASE_URL/g, '"./"');
+              rawCode = rawCode.replace(/import\.meta\.env/g, '({ BASE_URL: "./" })');
+
+              // Extract relative imports BEFORE Babel transform
+              var importRegex = /from\s+['"](\.[^'"]+)['"]|import\s+['"](\.[^'"]+)['"]/g;
+              var imports = [];
+              var m;
+              while ((m = importRegex.exec(rawCode)) !== null) {
+                imports.push(m[1] || m[2]);
+              }
+
+              // Cache ONLY the pure Babel transformation (with original relative import strings intact, NEVER caching dead blob: URLs)
+              var cacheKey = 'khojau_babel_raw_v3_' + modPath + '_' + rawCode.length;
+              var transformedCode = null;
+              try {
+                transformedCode = sessionStorage.getItem(cacheKey);
+              } catch (e) {}
+
+              if (!transformedCode) {
+                transformedCode = window.Babel.transform(rawCode, {
+                  filename: modPath.endsWith('.ts') || modPath.endsWith('.tsx') ? modPath : modPath + '.tsx',
+                  presets: [
+                    ['react', { runtime: 'automatic' }],
+                    ['typescript', { isTSX: true, allExtensions: true }]
+                  ]
+                }).code;
+                try {
+                  sessionStorage.setItem(cacheKey, transformedCode);
+                } catch (e) {}
+              }
+
+              var result = { transformedCode: transformedCode, imports: imports };
+              rawSourceCache[modPath] = result;
+              return result;
+            }
+
             function compileModule(modPath) {
               if (modulePromises[modPath]) return modulePromises[modPath];
 
@@ -123,33 +199,19 @@
                   return URL.createObjectURL(emptyBlob);
                 }
 
-                var res = await fetch(modPath);
-                if (!res.ok && !modPath.endsWith('.ts') && !modPath.endsWith('.tsx') && !modPath.endsWith('.json')) {
-                  res = await fetch(modPath + '.tsx');
-                  if (!res.ok) res = await fetch(modPath + '.ts');
-                }
-
                 if (modPath.endsWith('.json')) {
+                  var res = await fetch(modPath);
                   var jsonText = await res.text();
                   var jsonBlob = new Blob(['export default ' + jsonText + ';'], { type: 'application/javascript' });
                   return URL.createObjectURL(jsonBlob);
                 }
 
-                var code = await res.text();
-                code = code.replace(/import\s+type\s+[^;]+;/g, '');
-                code = code.replace(/import\.meta\.env\.BASE_URL/g, '"./"');
-                code = code.replace(/import\.meta\.env/g, '({ BASE_URL: "./" })');
+                var parsed = await fetchAndTransformRaw(modPath);
+                var finalCode = parsed.transformedCode;
 
-                // Find all relative imports and compile them in PARALLEL
-                var importRegex = /from\s+['"](\.[^'"]+)['"]|import\s+['"](\.[^'"]+)['"]/g;
-                var matches = [];
-                var m;
-                while ((m = importRegex.exec(code)) !== null) {
-                  matches.push(m[1] || m[2]);
-                }
-
+                // Resolve child modules in parallel and swap in fresh live Blob URLs for this page load
                 var resolvedMap = await Promise.all(
-                  matches.map(async function (rawImp) {
+                  parsed.imports.map(async function (rawImp) {
                     var resolved = resolvePath(modPath.replace(/^\.\//, ''), rawImp);
                     var blobUrl = await compileModule(resolved);
                     return { rawImp: rawImp, blobUrl: blobUrl };
@@ -158,30 +220,11 @@
 
                 for (var j = 0; j < resolvedMap.length; j++) {
                   var item = resolvedMap[j];
-                  code = code.split("'" + item.rawImp + "'").join("'" + item.blobUrl + "'");
-                  code = code.split('"' + item.rawImp + '"').join('"' + item.blobUrl + '"');
+                  finalCode = finalCode.split("'" + item.rawImp + "'").join("'" + item.blobUrl + "'");
+                  finalCode = finalCode.split('"' + item.rawImp + '"').join('"' + item.blobUrl + '"');
                 }
 
-                var cacheKey = 'khojau_babel_v2_' + modPath + '_' + code.length;
-                var transformed = null;
-                try {
-                  transformed = sessionStorage.getItem(cacheKey);
-                } catch {}
-
-                if (!transformed) {
-                  transformed = window.Babel.transform(code, {
-                    filename: modPath.endsWith('.ts') || modPath.endsWith('.tsx') ? modPath : modPath + '.tsx',
-                    presets: [
-                      ['react', { runtime: 'automatic' }],
-                      ['typescript', { isTSX: true, allExtensions: true }]
-                    ]
-                  }).code;
-                  try {
-                    sessionStorage.setItem(cacheKey, transformed);
-                  } catch {}
-                }
-
-                var blob = new Blob([transformed], { type: 'application/javascript' });
+                var blob = new Blob([finalCode], { type: 'application/javascript' });
                 return URL.createObjectURL(blob);
               })();
 
